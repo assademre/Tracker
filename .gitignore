@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+process_tracking.db
+process_tracking_export.json
+process_tracker_settings.json
+process_tracker_sync_repo/
+*.lnk
