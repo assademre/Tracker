@@ -1,6 +1,6 @@
 # Process Tracker
 
-A simple desktop app for logging game project progress with projects, categories, dates, time spent, notes, and basic analytics.
+A simple desktop app for logging project progress with projects, categories, dates, time spent, notes, and basic analytics.
 
 ## Features
 
