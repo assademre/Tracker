@@ -384,7 +384,8 @@ class ProcessTrackerDB:
     def get_overview(self, project_id: int | None = None) -> sqlite3.Row:
         seven_days_ago = (datetime.now() - timedelta(days=6)).date().isoformat()
         today = datetime.now().date().isoformat()
-        params: list[str | int] = [seven_days_ago, today]
+        month_prefix = datetime.now().strftime("%Y-%m")
+        params: list[str | int] = [seven_days_ago, today, month_prefix]
         project_filter = ""
         if project_id is not None:
             project_filter = "WHERE project_id = ?"
@@ -398,7 +399,9 @@ class ProcessTrackerDB:
                     COALESCE(SUM(hours), 0) AS total_hours,
                     COALESCE(AVG(hours), 0) AS average_hours,
                     COALESCE(SUM(CASE WHEN date(work_date) >= date(?) THEN hours END), 0) AS last_7_days,
-                    COALESCE(SUM(CASE WHEN date(work_date) = date(?) THEN hours END), 0) AS today_hours
+                    COALESCE(SUM(CASE WHEN date(work_date) = date(?) THEN hours END), 0) AS today_hours,
+                    COUNT(DISTINCT work_date) AS active_days,
+                    COALESCE(SUM(CASE WHEN substr(work_date, 1, 7) = ? THEN hours END), 0) AS this_month_hours
                 FROM sessions
                 {project_filter}
                 """,
@@ -457,6 +460,108 @@ class ProcessTrackerDB:
                 params,
             ).fetchall()
         return list(reversed(rows))
+
+    def get_daily_totals_in_range(
+        self,
+        project_id: int | None = None,
+        start_date: str = "",
+        end_date: str = "",
+    ) -> list[sqlite3.Row]:
+        query = """
+            SELECT work_date AS day, SUM(hours) AS total_hours
+            FROM sessions
+            WHERE 1 = 1
+        """
+        params: list[str | int] = []
+
+        if project_id is not None:
+            query += " AND project_id = ?"
+            params.append(project_id)
+
+        if start_date.strip():
+            query += " AND date(work_date) >= date(?)"
+            params.append(start_date.strip())
+
+        if end_date.strip():
+            query += " AND date(work_date) <= date(?)"
+            params.append(end_date.strip())
+
+        query += " GROUP BY work_date ORDER BY work_date ASC"
+
+        with self._connection() as connection:
+            return connection.execute(query, params).fetchall()
+
+    def get_streaks(self, project_id: int | None = None) -> dict[str, int]:
+        query = "SELECT DISTINCT work_date FROM sessions"
+        params: list[int] = []
+        if project_id is not None:
+            query += " WHERE project_id = ?"
+            params.append(project_id)
+        query += " ORDER BY work_date ASC"
+
+        with self._connection() as connection:
+            rows = connection.execute(query, params).fetchall()
+
+        days = [parse_iso_date(str(row["work_date"])) for row in rows]
+        if not days:
+            return {"current_streak": 0, "longest_streak": 0}
+
+        longest_streak = 1
+        running_streak = 1
+        for previous_day, current_day in zip(days, days[1:]):
+            if current_day - previous_day == timedelta(days=1):
+                running_streak += 1
+            else:
+                longest_streak = max(longest_streak, running_streak)
+                running_streak = 1
+        longest_streak = max(longest_streak, running_streak)
+
+        current_streak = 0
+        last_day = days[-1]
+        if last_day >= date.today() - timedelta(days=1):
+            current_streak = 1
+            index = len(days) - 1
+            while index > 0 and days[index] - days[index - 1] == timedelta(days=1):
+                current_streak += 1
+                index -= 1
+
+        return {
+            "current_streak": current_streak,
+            "longest_streak": longest_streak,
+        }
+
+    def get_weekly_totals(
+        self, project_id: int | None = None, weeks: int = 12
+    ) -> list[dict[str, object]]:
+        current_week_start = date.today() - timedelta(days=date.today().weekday())
+        first_week_start = current_week_start - timedelta(weeks=max(weeks - 1, 0))
+        last_week_end = current_week_start + timedelta(days=6)
+
+        totals_by_day = {
+            parse_iso_date(str(row["day"])): float(row["total_hours"])
+            for row in self.get_daily_totals_in_range(
+                project_id=project_id,
+                start_date=first_week_start.isoformat(),
+                end_date=last_week_end.isoformat(),
+            )
+        }
+
+        weekly_rows: list[dict[str, object]] = []
+        for week_index in range(weeks):
+            week_start = first_week_start + timedelta(weeks=week_index)
+            week_total = sum(
+                totals_by_day.get(week_start + timedelta(days=offset), 0.0)
+                for offset in range(7)
+            )
+            weekly_rows.append(
+                {
+                    "week_start": week_start.isoformat(),
+                    "total_hours": week_total,
+                    "is_current_week": week_start == current_week_start,
+                }
+            )
+
+        return weekly_rows
 
     def export_snapshot(self) -> dict[str, object]:
         with self._connection() as connection:
@@ -546,6 +651,8 @@ class ProcessTrackerApp:
         self.db = ProcessTrackerDB(DB_PATH)
         self.settings = self._load_settings()
         self.chart_rows: list[sqlite3.Row] = []
+        self.weekly_rows: list[dict[str, object]] = []
+        self.heatmap_totals: dict[date, float] = {}
         self.project_name_to_id: dict[str, int] = {}
         self.category_name_to_id_by_project: dict[int, dict[str, int]] = {}
         self.icon_image: tk.PhotoImage | None = None
@@ -581,6 +688,11 @@ class ProcessTrackerApp:
         self.total_hours_var = tk.StringVar()
         self.average_hours_var = tk.StringVar()
         self.last_7_days_var = tk.StringVar()
+        self.active_days_var = tk.StringVar()
+        self.avg_active_day_var = tk.StringVar()
+        self.this_month_hours_var = tk.StringVar()
+        self.current_streak_var = tk.StringVar()
+        self.heatmap_summary_var = tk.StringVar()
 
         self.root.title(APP_TITLE)
         self.root.geometry("1260x820")
@@ -1045,8 +1157,10 @@ class ProcessTrackerApp:
 
     def _build_analytics_tab(self) -> None:
         self.analytics_tab.columnconfigure(0, weight=1)
-        self.analytics_tab.rowconfigure(2, weight=1)
+        self.analytics_tab.rowconfigure(1, weight=0)
+        self.analytics_tab.rowconfigure(2, weight=2)
         self.analytics_tab.rowconfigure(3, weight=1)
+        self.analytics_tab.rowconfigure(4, weight=1)
 
         filter_row = ttk.Frame(self.analytics_tab)
         filter_row.grid(row=0, column=0, sticky="ew", pady=(0, 12))
@@ -1076,12 +1190,24 @@ class ProcessTrackerApp:
             ("Total Sessions", self.total_sessions_var),
             ("Total Hours", self.total_hours_var),
             ("Average / Session", self.average_hours_var),
+            ("Active Days", self.active_days_var),
             ("Last 7 Days", self.last_7_days_var),
+            ("This Month", self.this_month_hours_var),
+            ("Avg / Active Day", self.avg_active_day_var),
+            ("Current Streak", self.current_streak_var),
         )
 
         for index, (label, variable) in enumerate(metric_specs):
-            card = ttk.Frame(summary_row, style="Card.TFrame", padding=16)
-            card.grid(row=0, column=index, sticky="nsew", padx=(0, 10 if index < 3 else 0))
+            card = ttk.Frame(summary_row, style="Card.TFrame", padding=12)
+            row_index = index // 4
+            column_index = index % 4
+            card.grid(
+                row=row_index,
+                column=column_index,
+                sticky="nsew",
+                padx=(0, 10 if column_index < 3 else 0),
+                pady=(0, 10 if row_index == 0 else 0),
+            )
             ttk.Label(card, text=label, style="MetricCaption.TLabel").grid(
                 row=0, column=0, sticky="w"
             )
@@ -1109,7 +1235,7 @@ class ProcessTrackerApp:
             breakdown_card,
             columns=("category", "sessions", "hours"),
             show="headings",
-            height=8,
+            height=6,
         )
         self.breakdown_tree.grid(row=1, column=0, sticky="nsew")
         self.breakdown_tree.heading("category", text="Category")
@@ -1132,12 +1258,36 @@ class ProcessTrackerApp:
             background="#ffffff",
             highlightthickness=0,
             relief="flat",
+            height=220,
         )
         self.chart_canvas.grid(row=1, column=0, sticky="nsew")
-        self.chart_canvas.bind("<Configure>", lambda _event: self.draw_chart())
+        self.chart_canvas.bind("<Configure>", lambda _event: self.draw_category_chart())
 
-        daily_card = ttk.Frame(self.analytics_tab, style="Card.TFrame", padding=12)
-        daily_card.grid(row=3, column=0, sticky="nsew")
+        bottom_row = ttk.Frame(self.analytics_tab)
+        bottom_row.grid(row=3, column=0, sticky="nsew", pady=(0, 12))
+        bottom_row.columnconfigure(0, weight=2)
+        bottom_row.columnconfigure(1, weight=1)
+        bottom_row.rowconfigure(0, weight=1)
+
+        trend_card = ttk.Frame(bottom_row, style="Card.TFrame", padding=12)
+        trend_card.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        trend_card.columnconfigure(0, weight=1)
+        trend_card.rowconfigure(1, weight=1)
+        ttk.Label(trend_card, text="Weekly Trend", style="MetricCaption.TLabel").grid(
+            row=0, column=0, sticky="w", pady=(0, 10)
+        )
+        self.weekly_trend_canvas = tk.Canvas(
+            trend_card,
+            background="#ffffff",
+            highlightthickness=0,
+            relief="flat",
+            height=180,
+        )
+        self.weekly_trend_canvas.grid(row=1, column=0, sticky="nsew")
+        self.weekly_trend_canvas.bind("<Configure>", lambda _event: self.draw_weekly_trend())
+
+        daily_card = ttk.Frame(bottom_row, style="Card.TFrame", padding=12)
+        daily_card.grid(row=0, column=1, sticky="nsew")
         daily_card.columnconfigure(0, weight=1)
         daily_card.rowconfigure(1, weight=1)
         ttk.Label(daily_card, text="Last 14 Work Dates", style="MetricCaption.TLabel").grid(
@@ -1148,13 +1298,37 @@ class ProcessTrackerApp:
             daily_card,
             columns=("day", "hours"),
             show="headings",
-            height=7,
+            height=5,
         )
         self.daily_tree.grid(row=1, column=0, sticky="nsew")
         self.daily_tree.heading("day", text="Date")
         self.daily_tree.heading("hours", text="Logged Hours")
         self.daily_tree.column("day", width=180, anchor="w")
         self.daily_tree.column("hours", width=120, anchor="center")
+
+        heatmap_card = ttk.Frame(self.analytics_tab, style="Card.TFrame", padding=12)
+        heatmap_card.grid(row=4, column=0, sticky="nsew")
+        heatmap_card.columnconfigure(0, weight=1)
+        heatmap_card.rowconfigure(1, weight=1)
+        ttk.Label(heatmap_card, text="26-Week Calendar Heatmap", style="MetricCaption.TLabel").grid(
+            row=0, column=0, sticky="w", pady=(0, 10)
+        )
+        self.heatmap_canvas = tk.Canvas(
+            heatmap_card,
+            background="#ffffff",
+            highlightthickness=0,
+            relief="flat",
+            height=170,
+        )
+        self.heatmap_canvas.grid(row=1, column=0, sticky="nsew")
+        self.heatmap_canvas.bind("<Configure>", lambda _event: self.draw_heatmap())
+        ttk.Label(
+            heatmap_card,
+            textvariable=self.heatmap_summary_var,
+            style="CardMuted.TLabel",
+            justify="left",
+            wraplength=1080,
+        ).grid(row=2, column=0, sticky="w", pady=(10, 0))
 
     def _build_manage_tab(self) -> None:
         self.manage_tab.columnconfigure(0, weight=1)
@@ -2109,10 +2283,20 @@ class ProcessTrackerApp:
     def refresh_analytics(self) -> None:
         project_id = self._analytics_project_id()
         overview = self.db.get_overview(project_id=project_id)
+        streaks = self.db.get_streaks(project_id=project_id)
+        active_days = int(overview["active_days"])
+        total_hours = float(overview["total_hours"])
+
         self.total_sessions_var.set(str(overview["total_sessions"]))
-        self.total_hours_var.set(f"{overview['total_hours']:.2f} hrs")
+        self.total_hours_var.set(f"{total_hours:.2f} hrs")
         self.average_hours_var.set(f"{overview['average_hours']:.2f} hrs")
         self.last_7_days_var.set(f"{overview['last_7_days']:.2f} hrs")
+        self.active_days_var.set(str(active_days))
+        avg_active_day = total_hours / active_days if active_days else 0.0
+        self.avg_active_day_var.set(f"{avg_active_day:.2f} hrs")
+        self.this_month_hours_var.set(f"{overview['this_month_hours']:.2f} hrs")
+        current_streak = int(streaks["current_streak"])
+        self.current_streak_var.set(f"{current_streak} day" if current_streak == 1 else f"{current_streak} days")
 
         for item in self.breakdown_tree.get_children():
             self.breakdown_tree.delete(item)
@@ -2135,15 +2319,48 @@ class ProcessTrackerApp:
         for row in self.db.get_daily_totals(project_id=project_id):
             self.daily_tree.insert("", tk.END, values=(row["day"], f"{row['total_hours']:.2f}"))
 
-        self.draw_chart()
+        self.weekly_rows = self.db.get_weekly_totals(project_id=project_id, weeks=12)
 
-    def draw_chart(self) -> None:
+        current_week_start = date.today() - timedelta(days=date.today().weekday())
+        heatmap_start = current_week_start - timedelta(weeks=25)
+        heatmap_end = current_week_start + timedelta(days=6)
+        heatmap_rows = self.db.get_daily_totals_in_range(
+            project_id=project_id,
+            start_date=heatmap_start.isoformat(),
+            end_date=heatmap_end.isoformat(),
+        )
+        self.heatmap_totals = {
+            parse_iso_date(str(row["day"])): float(row["total_hours"]) for row in heatmap_rows
+        }
+        best_day_hours = max(self.heatmap_totals.values(), default=0.0)
+        if self.heatmap_totals:
+            longest_streak = int(streaks["longest_streak"])
+            self.heatmap_summary_var.set(
+                (
+                    f"{heatmap_start.strftime('%b %d')} to {heatmap_end.strftime('%b %d, %Y')}  "
+                    f"|  Best day: {best_day_hours:.2f} hrs  "
+                    f"|  Longest streak: {longest_streak} day"
+                    f"{'' if longest_streak == 1 else 's'}  "
+                    "|  Darker cells mean more logged hours."
+                )
+            )
+        else:
+            self.heatmap_summary_var.set("No activity in the selected scope yet.")
+
+        self.draw_category_chart()
+        self.draw_weekly_trend()
+        self.draw_heatmap()
+
+    def draw_category_chart(self) -> None:
         canvas = self.chart_canvas
         canvas.delete("all")
 
-        width = max(canvas.winfo_width(), 320)
-        height = max(canvas.winfo_height(), 240)
+        width = max(canvas.winfo_width(), 1)
+        height = max(canvas.winfo_height(), 1)
         canvas.create_rectangle(0, 0, width, height, fill="#ffffff", outline="")
+
+        if width < 160 or height < 120:
+            return
 
         if not self.chart_rows:
             canvas.create_text(
@@ -2156,15 +2373,16 @@ class ProcessTrackerApp:
             return
 
         max_hours = max(float(row["total_hours"]) for row in self.chart_rows)
-        left_margin = 200
-        right_margin = 24
-        top_margin = 24
-        bar_gap = 14
+        left_margin = min(220, max(132, int(width * 0.34)))
+        right_margin = 92
+        top_margin = 18
+        bar_gap = 10
         available_height = height - top_margin * 2
         bar_height = max(
-            18,
+            16,
             int((available_height - bar_gap * (len(self.chart_rows) - 1)) / len(self.chart_rows)),
         )
+        bar_area_width = max(width - left_margin - right_margin, 40)
 
         colors = ["#2d6cdf", "#4db6ac", "#f28b50", "#8b7cf6", "#55b66a", "#f0c44c"]
         project_id = self._analytics_project_id()
@@ -2174,13 +2392,14 @@ class ProcessTrackerApp:
             y1 = y0 + bar_height
             bar_width = 0
             if max_hours > 0:
-                bar_width = (width - left_margin - right_margin) * (
+                bar_width = bar_area_width * (
                     float(row["total_hours"]) / max_hours
                 )
 
             label = row["category_name"]
             if project_id is None:
                 label = f"{row['project_name']} / {row['category_name']}"
+            label = shorten_note(label, 28)
 
             canvas.create_text(
                 left_margin - 10,
@@ -2198,14 +2417,231 @@ class ProcessTrackerApp:
                 fill=colors[index % len(colors)],
                 outline="",
             )
+            value_text = f"{float(row['total_hours']):.2f} hrs"
+            value_x = left_margin + bar_width + 8
+            value_anchor = "w"
+            value_fill = "#506179"
+            if value_x + 60 > width - 8:
+                value_x = max(left_margin + bar_width - 8, left_margin + 10)
+                value_anchor = "e"
+                value_fill = "#ffffff" if bar_width >= 78 else "#172033"
             canvas.create_text(
-                left_margin + bar_width + 8,
+                value_x,
                 (y0 + y1) / 2,
-                text=f"{float(row['total_hours']):.2f} hrs",
-                fill="#506179",
-                anchor="w",
+                text=value_text,
+                fill=value_fill,
+                anchor=value_anchor,
                 font=("Segoe UI", 10),
             )
+
+    def draw_weekly_trend(self) -> None:
+        canvas = self.weekly_trend_canvas
+        canvas.delete("all")
+
+        width = max(canvas.winfo_width(), 1)
+        height = max(canvas.winfo_height(), 1)
+        canvas.create_rectangle(0, 0, width, height, fill="#ffffff", outline="")
+
+        if width < 220 or height < 120:
+            return
+
+        if not self.weekly_rows:
+            canvas.create_text(
+                width / 2,
+                height / 2,
+                text="Add more sessions to see weekly trends.",
+                fill="#66758c",
+                font=("Segoe UI", 12),
+            )
+            return
+
+        max_hours = max(float(row["total_hours"]) for row in self.weekly_rows)
+        if max_hours <= 0:
+            canvas.create_text(
+                width / 2,
+                height / 2,
+                text="No logged hours in the last 12 weeks.",
+                fill="#66758c",
+                font=("Segoe UI", 12),
+            )
+            return
+
+        left_margin = 42
+        right_margin = 18
+        top_margin = 24
+        bottom_margin = 38
+        chart_width = width - left_margin - right_margin
+        chart_height = height - top_margin - bottom_margin
+        slot_width = chart_width / max(len(self.weekly_rows), 1)
+        bar_width = max(12, slot_width * 0.58)
+
+        canvas.create_line(
+            left_margin,
+            height - bottom_margin,
+            width - right_margin,
+            height - bottom_margin,
+            fill="#d8e0ec",
+            width=1,
+        )
+
+        for guide_ratio in (0.25, 0.5, 0.75, 1.0):
+            y = top_margin + chart_height * (1 - guide_ratio)
+            canvas.create_line(
+                left_margin,
+                y,
+                width - right_margin,
+                y,
+                fill="#eef3fb",
+                width=1,
+            )
+            canvas.create_text(
+                left_margin - 8,
+                y,
+                text=f"{max_hours * guide_ratio:.1f}",
+                fill="#8191a8",
+                anchor="e",
+                font=("Segoe UI", 8),
+            )
+
+        for index, row in enumerate(self.weekly_rows):
+            week_hours = float(row["total_hours"])
+            week_start = parse_iso_date(str(row["week_start"]))
+            x_center = left_margin + slot_width * index + slot_width / 2
+            bar_height = chart_height * (week_hours / max_hours)
+            x0 = x_center - bar_width / 2
+            y0 = height - bottom_margin - bar_height
+            x1 = x_center + bar_width / 2
+            y1 = height - bottom_margin
+            fill = "#2d6cdf" if bool(row["is_current_week"]) else "#9dbdff"
+
+            canvas.create_rectangle(x0, y0, x1, y1, fill=fill, outline="")
+
+            if week_hours > 0:
+                canvas.create_text(
+                    x_center,
+                    y0 - 8,
+                    text=f"{week_hours:.1f}",
+                    fill="#506179",
+                    font=("Segoe UI", 8),
+                )
+
+            if index % 2 == 0 or bool(row["is_current_week"]):
+                canvas.create_text(
+                    x_center,
+                    height - bottom_margin + 16,
+                    text=week_start.strftime("%b %d"),
+                    fill="#66758c",
+                    font=("Segoe UI", 8),
+                )
+
+    def _heatmap_color(self, hours: float, max_hours: float, day: date) -> str:
+        if day > date.today():
+            return "#f7f9fc"
+        if hours <= 0:
+            return "#e7edf7"
+        if max_hours <= 0:
+            return "#d6e6ff"
+
+        ratio = hours / max_hours
+        if ratio <= 0.25:
+            return "#d6e6ff"
+        if ratio <= 0.5:
+            return "#a9c6ff"
+        if ratio <= 0.75:
+            return "#6f9ff5"
+        return "#2d6cdf"
+
+    def draw_heatmap(self) -> None:
+        canvas = self.heatmap_canvas
+        canvas.delete("all")
+
+        width = max(canvas.winfo_width(), 1)
+        height = max(canvas.winfo_height(), 1)
+        canvas.create_rectangle(0, 0, width, height, fill="#ffffff", outline="")
+
+        if width < 220 or height < 110:
+            return
+
+        current_week_start = date.today() - timedelta(days=date.today().weekday())
+        start_day = current_week_start - timedelta(weeks=25)
+        total_weeks = 26
+        max_hours = max(self.heatmap_totals.values(), default=0.0)
+
+        left_margin = 34
+        top_margin = 22
+        right_margin = 12
+        bottom_margin = 22
+        grid_width = width - left_margin - right_margin
+        grid_height = height - top_margin - bottom_margin
+        cell_size = min(grid_width / total_weeks, grid_height / 7)
+        cell_gap = max(1, int(cell_size * 0.12))
+        cell_span = max(cell_size - cell_gap, 4)
+
+        day_labels = ("M", "T", "W", "T", "F", "S", "S")
+        for day_index, day_label in enumerate(day_labels):
+            y = top_margin + day_index * cell_size + cell_span / 2
+            canvas.create_text(
+                left_margin - 10,
+                y,
+                text=day_label,
+                fill="#8191a8",
+                anchor="e",
+                font=("Segoe UI", 8),
+            )
+
+        previous_month: int | None = None
+        for week_index in range(total_weeks):
+            week_start = start_day + timedelta(weeks=week_index)
+            if previous_month != week_start.month:
+                x = left_margin + week_index * cell_size
+                canvas.create_text(
+                    x,
+                    top_margin - 10,
+                    text=week_start.strftime("%b"),
+                    fill="#66758c",
+                    anchor="w",
+                    font=("Segoe UI Semibold", 8),
+                )
+                previous_month = week_start.month
+
+            for day_index in range(7):
+                current_day = week_start + timedelta(days=day_index)
+                hours = self.heatmap_totals.get(current_day, 0.0)
+                x0 = left_margin + week_index * cell_size
+                y0 = top_margin + day_index * cell_size
+                x1 = x0 + cell_span
+                y1 = y0 + cell_span
+                canvas.create_rectangle(
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    fill=self._heatmap_color(hours, max_hours, current_day),
+                    outline="",
+                )
+
+        legend_y = height - 10
+        legend_x = max(left_margin, width - 118)
+        canvas.create_text(
+            legend_x - 12,
+            legend_y,
+            text="Less",
+            fill="#8191a8",
+            anchor="e",
+            font=("Segoe UI", 8),
+        )
+        legend_colors = ["#e7edf7", "#d6e6ff", "#a9c6ff", "#6f9ff5", "#2d6cdf"]
+        for index, color in enumerate(legend_colors):
+            x0 = legend_x + index * 14
+            canvas.create_rectangle(x0, legend_y - 5, x0 + 10, legend_y + 5, fill=color, outline="")
+        canvas.create_text(
+            legend_x + len(legend_colors) * 14 + 6,
+            legend_y,
+            text="More",
+            fill="#8191a8",
+            anchor="w",
+            font=("Segoe UI", 8),
+        )
 
 
 def main() -> None:
